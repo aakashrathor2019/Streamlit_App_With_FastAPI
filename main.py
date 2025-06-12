@@ -1,52 +1,74 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Depends
-from sqlalchemy import Column, Integer, create_engine, String, LargeBinary
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session, declarative_base
+from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+import tempfile
 import os
+import psycopg2
+
+app = FastAPI()
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 load_dotenv()
 
 
-app=FastAPI()
-
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_NAME = os.getenv("DB_NAME")
-
-DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
-engine = create_engine(DATABASE_URL)
-Base = declarative_base()
+DATABASE_URL = os.getenv("DATABASE_URL")
+print(DATABASE_URL)
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable is not set")
 
 
-class PDFFile(Base):
-    __tablename__ = "pdf_files"
-    id= Column(Integer,primary_key= True, index=True)
-    filename = Column(String)
-    data = Column(LargeBinary)
-
-Base.metadata.create_all(bind=engine)
+@app.post("/upload_pdf/")
+async def upload_pdf(file: UploadFile = File(...)):
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    temp_file.write(await file.read())
+    temp_file.close()
 
 
-def get_db():
-    db = sessionmaker(autocommit=False, autoflush=False, bind=engine)()
-    try:
-        yield db
-    finally:
-        db.close()
+    loader = PyPDFLoader(temp_file.name)
+    docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = splitter.split_documents(docs)
+
+    embedding = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 
-@app.post("/")
-async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    try:
-        contents = await file.read()
-        pdf_file = PDFFile(filename=file.filename, data=contents)
-        db.add(pdf_file)
-        db.commit()
-        db.refresh(pdf_file)
-        print("Susess")
-        return {"message": "PDF uploaded successfully", "file_id": pdf_file.id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
+    print("Connecting to PostgreSQL...")
+    conn = psycopg2.connect(DATABASE_URL)
+    print("CONNECTION---->>",conn)
+    cursor = conn.cursor()
+    print("CURSOR---->>",cursor)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS files (
+            id SERIAL PRIMARY KEY,
+            filename TEXT NOT NULL,
+            filetype TEXT NOT NULL,
+            filedata BYTEA NOT NULL
+        );
+    """)
+    conn.commit()
+
+    with open(temp_file.name, 'rb') as f:
+        binary_data = f.read()
+        cursor.execute(
+            "INSERT INTO files (filename, filetype, filedata) VALUES (%s, %s, %s)",
+            (file.filename, file.content_type, binary_data)
+        )
+        conn.commit()
+    cursor.close()
+    conn.close()
+
+    os.remove(temp_file.name)
+
+    return {"status": "success", "message": "PDF uploaded and stored"}
